@@ -11,11 +11,15 @@ const { MongoClient, ServerApiVersion } = require('mongodb');
 const app = express();
 const port = Number(process.env.PORT) || 5000;
 const authUrl = process.env.BETTER_AUTH_URL || 'http://localhost:3000';
+
 const catalog = require(path.join(__dirname, '../leebazz-client/public/leebazz-expanded-catalog.json'));
+
 const productsById = new Map(
   catalog.products.filter((product) => product.isActive).map((product) => [product.id, product]),
 );
+
 const collectionNames = { cart: 'carts', wishlist: 'wishlists' };
+
 const initializedIndexes = new Set();
 let db;
 
@@ -51,6 +55,83 @@ async function getAuthenticatedUser(req) {
   const session = await response.json();
   return session?.user?.id ? session.user : null;
 }
+
+// Attach this middleware to every /api/admin route. Identity and role come
+// from the Better Auth session cookie, never from client-supplied request data.
+async function requireAdmin(req, res, next) {
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user) return res.status(401).json({ error: 'Please sign in to continue.' });
+    if (user.role !== 'admin') return res.status(403).json({ error: 'Admin access required.' });
+    req.authenticatedUser = user;
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+}
+
+// Register all admin APIs on this router so the Better Auth role check is applied by default.
+const adminApi = express.Router();
+adminApi.use(requireAdmin);
+
+app.post('/api/faq-queries', async (req, res, next) => {
+  try {
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const query = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
+    const website = typeof req.body?.website === 'string' ? req.body.website.trim() : '';
+
+    // Silently accept bot submissions caught by the form's honeypot field.
+    if (website) return res.status(201).json({ ok: true });
+    if (!name || !email || !query) {
+      return res.status(400).json({ error: 'Please enter your name, email, and question.' });
+    }
+    if (name.length > 100 || email.length > 254 || query.length > 5000) {
+      return res.status(400).json({ error: 'Your name, email, or question is too long.' });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+
+    const result = await db.collection('faqQueries').insertOne({
+      name,
+      email,
+      query,
+      status: 'new',
+      createdAt: new Date(),
+    });
+    return res.status(201).json({ ok: true, id: result.insertedId.toString() });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+adminApi.get('/faq-queries', async (req, res, next) => {
+  try {
+    res.set('Cache-Control', 'no-store');
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const pageSize = 50;
+    const collection = db.collection('faqQueries');
+    const [queries, total] = await Promise.all([collection
+      .find({}, { projection: { name: 1, email: 1, query: 1, status: 1, createdAt: 1 } })
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * pageSize)
+      .limit(pageSize)
+      .toArray(), collection.countDocuments()]);
+    return res.json({ page, total, hasMore: page * pageSize < total, queries: queries.map((item) => ({
+      id: item._id.toString(),
+      name: item.name,
+      email: item.email,
+      query: item.query,
+      status: item.status,
+      createdAt: item.createdAt,
+    })) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.use('/api/admin', adminApi);
 
 async function resolveAccount(req, res, next) {
   const collectionName = collectionNames[req.params.resource];
@@ -216,7 +297,7 @@ app.delete('/api/account/:resource', resolveAccount, async (req, res, next) => {
 app.get('/', (req, res) => res.send('Leebazz Server is running.'));
 
 app.use((error, req, res, next) => {
-  console.error('Account API request failed:', error);
+  console.error('API request failed:', error);
   if (res.headersSent) return next(error);
   return res.status(500).json({ error: 'Could not complete your request.' });
 });
@@ -229,13 +310,7 @@ async function run() {
   try {
     await client.connect();
     db = client.db('leebazz');
-  
-    
-   
-
-    
-
-    
+    await db.collection('faqQueries').createIndex({ createdAt: -1 });
 
     // Start Express Server
     app.listen(port, () => {
