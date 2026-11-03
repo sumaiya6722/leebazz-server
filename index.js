@@ -142,9 +142,182 @@ async function releaseOrderInventory(orderId, items, restoreStock) {
   }
 }
 
+async function loadProducts() {
+  const sourceProducts = catalog.products.filter((product) => product.isActive);
+  const productIds = sourceProducts.map((product) => product.id);
+  const [settings, inventory] = await Promise.all([
+    db.collection('productSettings').find({ productId: { $in: productIds } }).toArray(),
+    db.collection('inventory').find({ productId: { $in: productIds } }).toArray(),
+  ]);
+  const settingsById = new Map(settings.map((item) => [item.productId, item]));
+  const inventoryByVariant = new Map(
+    inventory.map((item) => [`${item.productId}:${item.variantSku}`, item]),
+  );
+
+  return sourceProducts.map((product) => {
+    const savedSettings = settingsById.get(product.id);
+    const variants = product.variants.map((variant) => ({
+      ...variant,
+      stock: inventoryByVariant.get(`${product.id}:${variant.sku}`)?.stock ?? variant.stock,
+    }));
+    return {
+      ...product,
+      variants,
+      totalStock: variants.reduce((total, variant) => total + variant.stock, 0),
+      isActive: savedSettings?.isActive ?? product.isActive,
+      isNewArrival: savedSettings?.isNewArrival ?? product.isNewArrival,
+    };
+  }).filter((product) => product.isActive);
+}
+
+app.get('/api/products', async (req, res, next) => {
+  try {
+    res.set('Cache-Control', 'no-store');
+    return res.json({
+      categories: catalog.categories,
+      homepage: catalog.homepage,
+      products: await loadProducts(),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 // Register all admin APIs on this router so the Better Auth role check is applied by default.
 const adminApi = express.Router();
 adminApi.use(requireAdmin);
+
+adminApi.get('/dashboard', async (req, res, next) => {
+  try {
+    res.set('Cache-Control', 'no-store');
+    const orders = db.collection('orders');
+    const [customers, orderCount, revenueRows, paidOrders, pendingOrders, products, recentOrders] = await Promise.all([
+      db.collection('user').countDocuments({ role: { $ne: 'admin' } }),
+      orders.countDocuments(),
+      orders.aggregate([
+        { $match: { paymentStatus: 'paid' } },
+        { $group: { _id: null, total: { $sum: { $ifNull: ['$total', 0] } } } },
+      ]).toArray(),
+      orders.countDocuments({ paymentStatus: 'paid' }),
+      orders.countDocuments({ status: 'pending_confirmation' }),
+      loadProducts(),
+      orders.find({}, {
+        projection: {
+          orderNumber: 1,
+          customer: 1,
+          total: 1,
+          status: 1,
+          paymentStatus: 1,
+          createdAt: 1,
+        },
+      }).sort({ createdAt: -1 }).limit(6).toArray(),
+    ]);
+
+    return res.json({
+      customers,
+      orders: orderCount,
+      products: products.length,
+      outOfStockProducts: products.filter((product) => product.totalStock <= 0).length,
+      revenue: revenueRows[0]?.total || 0,
+      paidOrders,
+      pendingOrders,
+      recentOrders: recentOrders.map((order) => ({
+        id: order._id.toString(),
+        orderNumber: order.orderNumber,
+        customerName: order.customer?.name || 'Customer',
+        total: order.total,
+        status: order.status,
+        paymentStatus: order.paymentStatus,
+        createdAt: order.createdAt,
+      })),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+adminApi.get('/customers', async (req, res, next) => {
+  try {
+    res.set('Cache-Control', 'no-store');
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const pageSize = 50;
+    const users = db.collection('user');
+    const filter = { role: { $ne: 'admin' } };
+    const [records, total] = await Promise.all([
+      users.find(filter, {
+        projection: {
+          name: 1,
+          email: 1,
+          emailVerified: 1,
+          image: 1,
+          role: 1,
+          banned: 1,
+          banReason: 1,
+          createdAt: 1,
+        },
+      }).sort({ createdAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).toArray(),
+      users.countDocuments(filter),
+    ]);
+    const customerIds = records.map((user) => String(user._id));
+    const orders = customerIds.length
+      ? await db.collection('orders').find(
+          { userId: { $in: customerIds } },
+          {
+            projection: {
+              userId: 1,
+              orderNumber: 1,
+              items: 1,
+              total: 1,
+              status: 1,
+              paymentStatus: 1,
+              createdAt: 1,
+            },
+          },
+        ).sort({ createdAt: -1 }).toArray()
+      : [];
+    const ordersByUser = new Map(customerIds.map((id) => [id, []]));
+    for (const order of orders) {
+      ordersByUser.get(order.userId)?.push({
+        id: order._id.toString(),
+        orderNumber: order.orderNumber,
+        items: order.items.map((item) => ({
+          productName: item.productName,
+          quantity: item.quantity,
+        })),
+        total: order.total,
+        status: order.status,
+        paymentStatus: order.paymentStatus,
+        createdAt: order.createdAt,
+      });
+    }
+
+    return res.json({
+      page,
+      total,
+      hasMore: page * pageSize < total,
+      customers: records.map((user) => {
+        const id = String(user._id);
+        const customerOrders = ordersByUser.get(id) || [];
+        return {
+          id,
+          name: user.name,
+          email: user.email,
+          emailVerified: Boolean(user.emailVerified),
+          image: user.image || null,
+          role: user.role || 'user',
+          banned: Boolean(user.banned),
+          banReason: user.banReason || '',
+          createdAt: user.createdAt,
+          orderCount: customerOrders.length,
+          totalSpent: customerOrders.reduce((sum, order) => sum + (order.total || 0), 0),
+          orders: customerOrders,
+        };
+      }),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
 
 app.post('/api/faq-queries', async (req, res, next) => {
   try {
@@ -165,14 +338,216 @@ app.post('/api/faq-queries', async (req, res, next) => {
       return res.status(400).json({ error: 'Please enter a valid email address.' });
     }
 
+    const user = req.headers.cookie ? await getAuthenticatedUser(req) : null;
     const result = await db.collection('faqQueries').insertOne({
       name,
       email,
       query,
+      ...(typeof user?.email === 'string' && user.email.toLowerCase() === email
+        ? { userId: user.id }
+        : {}),
       status: 'new',
       createdAt: new Date(),
     });
     return res.status(201).json({ ok: true, id: result.insertedId.toString() });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get('/api/customer/faq-replies/unread-count', requireCustomer, async (req, res, next) => {
+  try {
+    res.set('Cache-Control', 'no-store');
+    const user = req.authenticatedUser;
+    const email = typeof user.email === 'string' ? user.email.toLowerCase() : '';
+    const filter = {
+      reply: { $type: 'string', $ne: '' },
+      readAt: { $exists: false },
+      $or: [
+        { userId: user.id },
+        ...(email ? [{ userId: { $exists: false }, email }] : []),
+      ],
+    };
+    const count = await db.collection('faqQueries').countDocuments(filter);
+    return res.json({ count });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get('/api/customer/faq-replies', requireCustomer, async (req, res, next) => {
+  try {
+    res.set('Cache-Control', 'no-store');
+    const user = req.authenticatedUser;
+    const collection = db.collection('faqQueries');
+    const email = typeof user.email === 'string' ? user.email.toLowerCase() : '';
+    const filter = {
+      $or: [
+        { userId: user.id },
+        ...(email ? [{ userId: { $exists: false }, email }] : []),
+      ],
+    };
+    const [queries] = await Promise.all([
+      collection.find(filter, {
+        projection: {
+          name: 1,
+          email: 1,
+          query: 1,
+          reply: 1,
+          status: 1,
+          createdAt: 1,
+          repliedAt: 1,
+        },
+      }).sort({ createdAt: -1 }).limit(100).toArray(),
+      collection.updateMany(
+        { ...filter, reply: { $type: 'string', $ne: '' }, readAt: { $exists: false } },
+        { $set: { readAt: new Date() } },
+      ),
+    ]);
+    return res.json({
+      queries: queries.map((item) => ({
+        id: item._id.toString(),
+        name: item.name,
+        query: item.query,
+        reply: item.reply || '',
+        status: item.status,
+        createdAt: item.createdAt,
+        repliedAt: item.repliedAt || null,
+      })),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+adminApi.patch('/faq-queries/:id/reply', async (req, res, next) => {
+  try {
+    if (!/^[a-f\d]{24}$/i.test(req.params.id)) {
+      return res.status(400).json({ error: 'Choose a valid customer question.' });
+    }
+    const reply = typeof req.body?.reply === 'string' ? req.body.reply.trim() : '';
+    if (!reply || reply.length > 5000) {
+      return res.status(400).json({ error: 'Enter a reply between 1 and 5,000 characters.' });
+    }
+
+    const result = await db.collection('faqQueries').findOneAndUpdate(
+      { _id: new ObjectId(req.params.id) },
+      {
+        $set: {
+          reply,
+          repliedAt: new Date(),
+          repliedBy: req.authenticatedUser.id,
+          status: 'answered',
+        },
+        $unset: { readAt: '' },
+      },
+      { returnDocument: 'after' },
+    );
+    if (!result) return res.status(404).json({ error: 'Customer question not found.' });
+    return res.json({
+      query: {
+        id: result._id.toString(),
+        reply: result.reply,
+        repliedAt: result.repliedAt,
+        status: result.status,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+adminApi.get('/products', async (req, res, next) => {
+  try {
+    res.set('Cache-Control', 'no-store');
+    return res.json({ categories: catalog.categories, products: await loadProducts() });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+adminApi.patch('/products/:id', async (req, res, next) => {
+  try {
+    const product = productsById.get(req.params.id);
+    if (!product) return res.status(404).json({ error: 'Product not found.' });
+
+    const isNewArrival = req.body?.isNewArrival;
+    const variants = req.body?.variants;
+    if (
+      typeof isNewArrival !== 'boolean'
+      || !Array.isArray(variants)
+      || variants.length !== product.variants.length
+    ) {
+      return res.status(400).json({ error: 'Provide a new-arrival setting and a quantity for every product variant.' });
+    }
+
+    const stocksBySku = new Map();
+    for (const variant of variants) {
+      if (
+        typeof variant?.sku !== 'string'
+        || !product.variants.some((item) => item.sku === variant.sku)
+        || !Number.isInteger(variant.stock)
+        || variant.stock < 0
+        || variant.stock > 99999
+        || stocksBySku.has(variant.sku)
+      ) {
+        return res.status(400).json({ error: 'Enter a valid non-negative quantity for every product variant.' });
+      }
+      stocksBySku.set(variant.sku, variant.stock);
+    }
+    if (stocksBySku.size !== product.variants.length) {
+      return res.status(400).json({ error: 'Provide a quantity for every product variant.' });
+    }
+
+    const settings = db.collection('productSettings');
+    const currentSettings = await settings.findOne({ productId: product.id });
+    if (currentSettings?.isActive === false) {
+      return res.status(404).json({ error: 'Product not found.' });
+    }
+
+    const now = new Date();
+    await db.collection('inventory').bulkWrite(
+      [...stocksBySku].map(([variantSku, stock]) => ({
+        updateOne: {
+          filter: { productId: product.id, variantSku },
+          update: { $set: { stock, updatedAt: now } },
+          upsert: true,
+        },
+      })),
+      { ordered: true },
+    );
+    await settings.updateOne(
+      { productId: product.id },
+      {
+        $set: { isNewArrival, isActive: true, updatedAt: now },
+        $setOnInsert: { productId: product.id, createdAt: now },
+      },
+      { upsert: true },
+    );
+    const updatedProduct = (await loadProducts()).find((item) => item.id === product.id);
+    return res.json({ product: updatedProduct });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+adminApi.delete('/products/:id', async (req, res, next) => {
+  try {
+    const product = productsById.get(req.params.id);
+    if (!product) return res.status(404).json({ error: 'Product not found.' });
+
+    const result = await db.collection('productSettings').updateOne(
+      { productId: product.id },
+      { $set: { isActive: false, updatedAt: new Date() } },
+    );
+    if (!result.matchedCount) {
+      return res.status(404).json({ error: 'Product not found.' });
+    }
+    await Promise.all([
+      db.collection(collectionNames.cart).deleteMany({ productId: product.id }),
+      db.collection(collectionNames.wishlist).deleteMany({ productId: product.id }),
+    ]);
+    return res.json({ ok: true });
   } catch (error) {
     return next(error);
   }
@@ -185,7 +560,7 @@ adminApi.get('/faq-queries', async (req, res, next) => {
     const pageSize = 50;
     const collection = db.collection('faqQueries');
     const [queries, total] = await Promise.all([collection
-      .find({}, { projection: { name: 1, email: 1, query: 1, status: 1, createdAt: 1 } })
+      .find({}, { projection: { name: 1, email: 1, query: 1, reply: 1, status: 1, createdAt: 1, repliedAt: 1 } })
       .sort({ createdAt: -1 })
       .skip((page - 1) * pageSize)
       .limit(pageSize)
@@ -195,8 +570,10 @@ adminApi.get('/faq-queries', async (req, res, next) => {
       name: item.name,
       email: item.email,
       query: item.query,
+      reply: item.reply || '',
       status: item.status,
       createdAt: item.createdAt,
+      repliedAt: item.repliedAt || null,
     })) });
   } catch (error) {
     return next(error);
@@ -416,7 +793,13 @@ app.post('/api/orders', requireCustomer, async (req, res, next) => {
       seenLines.add(key);
       const product = productsById.get(productId);
       const variant = product?.variants?.find((item) => item.sku === variantSku);
-      if (!product || !variant || !Number.isFinite(variant.stock) || variant.stock < quantity) {
+      const settings = product
+        ? await db.collection('productSettings').findOne({ productId })
+        : null;
+      const stock = product && variant
+        ? await db.collection('inventory').findOne({ productId, variantSku })
+        : null;
+      if (!product || settings?.isActive === false || !variant || !stock || stock.stock < quantity) {
         return res.status(409).json({ error: `${product?.name || 'A product'} is unavailable in the selected quantity.` });
       }
       const image = product.images.find((item) => item.isPrimary)?.url || product.images[0]?.url || '';
@@ -593,8 +976,9 @@ app.get('/api/account/:resource', resolveAccount, async (req, res, next) => {
   try {
     const { collection, userId, resource } = req.account;
     const savedItems = await collection.find({ userId }).sort({ updatedAt: -1 }).toArray();
+    const activeProducts = new Map((await loadProducts()).map((product) => [product.id, product]));
     const items = savedItems.flatMap((saved) => {
-      const product = productsById.get(saved.productId);
+      const product = activeProducts.get(saved.productId);
       if (!product) return [];
       const selectedVariant = resource === 'cart'
         ? product.variants.find((variant) => variant.sku === saved.variantSku) || product.variants[0]
@@ -632,11 +1016,26 @@ app.post('/api/account/:resource', resolveAccount, async (req, res, next) => {
     const { collection, userId, resource } = req.account;
     const variantSku = typeof req.body?.variantSku === 'string' ? req.body.variantSku.trim() : '';
     const product = productsById.get(productId);
+    const settings = product
+      ? await db.collection('productSettings').findOne({ productId })
+      : null;
+    if (!product || settings?.isActive === false) {
+      return res.status(400).json({ error: 'Choose a valid product.' });
+    }
     const selectedVariant = resource === 'cart'
       ? product.variants.find((variant) => variant.sku === variantSku) || (product.variants.length === 1 ? product.variants[0] : null)
       : null;
     if (resource === 'cart' && !selectedVariant) {
       return res.status(400).json({ error: 'Choose an available size.' });
+    }
+    if (resource === 'cart') {
+      const inventory = await db.collection('inventory').findOne({
+        productId,
+        variantSku: selectedVariant.sku,
+      });
+      if (!inventory || inventory.stock < 1) {
+        return res.status(409).json({ error: 'This product is currently out of stock.' });
+      }
     }
     if (resource === 'wishlist') {
       const alreadyInCart = await db.collection(collectionNames.cart).findOne({ userId, productId });
@@ -791,6 +1190,25 @@ async function run() {
       },
     })));
   if (inventoryUpdates.length) await inventory.bulkWrite(inventoryUpdates, { ordered: false });
+  const productSettingsUpdates = catalog.products
+    .filter((product) => product.isActive)
+    .map((product) => ({
+      updateOne: {
+        filter: { productId: product.id },
+        update: {
+          $setOnInsert: {
+            productId: product.id,
+            isActive: product.isActive,
+            isNewArrival: product.isNewArrival,
+            createdAt: new Date(),
+          },
+        },
+        upsert: true,
+      },
+    }));
+  if (productSettingsUpdates.length) {
+    await db.collection('productSettings').bulkWrite(productSettingsUpdates, { ordered: false });
+  }
 
   // Start Express Server
   app.listen(port, () => {
