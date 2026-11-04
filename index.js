@@ -39,8 +39,9 @@ const deliveryFee = Number.isInteger(configuredDeliveryFee) && configuredDeliver
   ? configuredDeliveryFee
   : 80;
 
-const initializedIndexes = new Set();
+const accountIndexPromises = new Map();
 let db;
+let initializationPromise;
 
 if (!process.env.MONGO_URL) {
   throw new Error('MONGO_URL is not configured in leebazz-server/.env');
@@ -54,16 +55,23 @@ app.use(cors({
   allowedHeaders: ['Content-Type'],
 }));
 app.use(express.json({ limit: '32kb' }));
+app.use(async (req, res, next) => {
+  await initializeOnce();
+  next();
+});
 
 // MongoDB Connection Setup
 const uri = process.env.MONGO_URL;
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  }
-});
+function createMongoClient() {
+  return new MongoClient(uri, {
+    serverApi: {
+      version: ServerApiVersion.v1,
+      strict: true,
+      deprecationErrors: true,
+    }
+  });
+}
+let client = createMongoClient();
 
 async function getAuthenticatedUser(req) {
   const response = await fetch(`${authUrl}/api/auth/get-session`, {
@@ -936,12 +944,25 @@ async function resolveAccount(req, res, next) {
     const user = await getAuthenticatedUser(req);
     if (!user) return res.status(401).json({ error: 'Please sign in to continue.' });
 
-    if (!initializedIndexes.has(collectionName)) {
-      if (req.params.resource === 'cart') {
-        const indexes = await db.collection(collectionName).indexes().catch(() => []);
-        if (indexes.some((index) => index.name === 'userId_1_productId_1')) {
-          await db.collection(collectionName).dropIndex('userId_1_productId_1');
-        }
+    await initializeAccountIndexes(req.params.resource, collectionName);
+
+    req.account = {
+      userId: user.id,
+      resource: req.params.resource,
+      collection: db.collection(collectionName),
+    };
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+}
+
+function initializeAccountIndexes(resource, collectionName) {
+  let promise = accountIndexPromises.get(collectionName);
+  if (!promise) {
+    promise = Promise.resolve().then(async () => {
+      if (resource === 'cart') {
+        // Manually remove any legacy cart index before deployment; requests never drop indexes.
         const legacyItems = await db.collection(collectionName).find({ variantSku: { $exists: false } }).toArray();
         for (const item of legacyItems) {
           const product = productsById.get(item.productId);
@@ -962,18 +983,15 @@ async function resolveAccount(req, res, next) {
           { unique: true },
         );
       }
-      initializedIndexes.add(collectionName);
-    }
-
-    req.account = {
-      userId: user.id,
-      resource: req.params.resource,
-      collection: db.collection(collectionName),
-    };
-    return next();
-  } catch (error) {
-    return next(error);
+    }).catch((error) => {
+      if (accountIndexPromises.get(collectionName) === promise) {
+        accountIndexPromises.delete(collectionName);
+      }
+      throw error;
+    });
+    accountIndexPromises.set(collectionName, promise);
   }
+  return promise;
 }
 
 app.get('/api/account/:resource', resolveAccount, async (req, res, next) => {
@@ -1125,7 +1143,7 @@ app.use((error, req, res, next) => {
 
 
 
-async function run() {
+async function initializeApplication() {
   await client.connect();
   db = client.db('leebazz');
   await db.collection('faqQueries').createIndex({ createdAt: -1 });
@@ -1133,37 +1151,7 @@ async function run() {
   const idempotencyIndexName = 'orders_user_idempotency_unique';
   const idempotencyIndexKey = { userId: 1, idempotencyKey: 1 };
   const idempotencyPartialFilter = { idempotencyKey: { $type: 'string' } };
-  const knownIndexFields = new Set([
-    'v',
-    'key',
-    'name',
-    'ns',
-    'unique',
-    'background',
-    'partialFilterExpression',
-  ]);
-  const existingIdempotencyIndex = (await orders.listIndexes().toArray())
-    .find((index) => index.name === idempotencyIndexName);
-  if (existingIdempotencyIndex) {
-    const hasExpectedKey = Object.keys(existingIdempotencyIndex.key).length === 2
-      && existingIdempotencyIndex.key.userId === 1
-      && existingIdempotencyIndex.key.idempotencyKey === 1;
-    const hasOnlyKnownFields = Object.keys(existingIdempotencyIndex)
-      .every((field) => knownIndexFields.has(field));
-    const isLegacyIndex = hasExpectedKey
-      && existingIdempotencyIndex.unique === true
-      && !existingIdempotencyIndex.partialFilterExpression
-      && hasOnlyKnownFields;
-    const isCurrentIndex = hasExpectedKey
-      && existingIdempotencyIndex.unique === true
-      && JSON.stringify(existingIdempotencyIndex.partialFilterExpression) === JSON.stringify(idempotencyPartialFilter)
-      && hasOnlyKnownFields;
-    if (isLegacyIndex) {
-      await orders.dropIndex(idempotencyIndexName);
-    } else if (!isCurrentIndex) {
-      throw new Error(`Cannot safely replace ${idempotencyIndexName}: its definition differs from the expected unique index.`);
-    }
-  }
+  // Manually drop a legacy index with this name before deployment; startup does not replace indexes.
   await orders.createIndex(idempotencyIndexKey, {
     unique: true,
     name: idempotencyIndexName,
@@ -1213,19 +1201,38 @@ async function run() {
   if (productSettingsUpdates.length) {
     await db.collection('productSettings').bulkWrite(productSettingsUpdates, { ordered: false });
   }
-
-  // Start Express Server
-  app.listen(port, () => {
-    console.log(`Leebazz Server running on port ${port}`);
-  });
 }
 
-run().catch(async (error) => {
-  console.error('Leebazz server startup failed:', error);
-  try {
-    await client.close();
-  } catch (closeError) {
-    console.error('Could not close MongoDB after startup failure:', closeError);
+function initializeOnce() {
+  if (!initializationPromise) {
+    const attempt = initializeApplication().catch(async (error) => {
+      console.error('Leebazz server initialization failed:', error);
+      try {
+        await client.close();
+      } catch (closeError) {
+        console.error('Could not close MongoDB after initialization failure:', closeError);
+      } finally {
+        client = createMongoClient();
+        db = undefined;
+      }
+      throw error;
+    });
+    initializationPromise = attempt.catch((error) => {
+      initializationPromise = undefined;
+      throw error;
+    });
   }
-  process.exitCode = 1;
-});
+  return initializationPromise;
+}
+
+module.exports = app;
+
+if (require.main === module) {
+  initializeOnce().then(() => {
+    app.listen(port, () => {
+      console.log(`Leebazz Server running on port ${port}`);
+    });
+  }).catch(() => {
+    process.exitCode = 1;
+  });
+}
