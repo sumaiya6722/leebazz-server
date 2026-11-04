@@ -12,7 +12,7 @@ const app = express();
 const port = Number(process.env.PORT) || 5000;
 const authUrl = process.env.BETTER_AUTH_URL || 'http://localhost:3000';
 
-const catalog = require(path.join(__dirname, '../leebazz-client/public/leebazz-expanded-catalog.json'));
+const catalog = require(path.join(__dirname, '../leebazz-client/public/leebazz-import-ready-catalog-final.json'));
 
 const productsById = new Map(
   catalog.products.filter((product) => product.isActive).map((product) => [product.id, product]),
@@ -359,7 +359,9 @@ app.get('/api/customer/faq-replies/unread-count', requireCustomer, async (req, r
   try {
     res.set('Cache-Control', 'no-store');
     const user = req.authenticatedUser;
-    const email = typeof user.email === 'string' ? user.email.toLowerCase() : '';
+    const email = user.emailVerified === true && typeof user.email === 'string'
+      ? user.email.toLowerCase()
+      : '';
     const filter = {
       reply: { $type: 'string', $ne: '' },
       readAt: { $exists: false },
@@ -380,7 +382,9 @@ app.get('/api/customer/faq-replies', requireCustomer, async (req, res, next) => 
     res.set('Cache-Control', 'no-store');
     const user = req.authenticatedUser;
     const collection = db.collection('faqQueries');
-    const email = typeof user.email === 'string' ? user.email.toLowerCase() : '';
+    const email = user.emailVerified === true && typeof user.email === 'string'
+      ? user.email.toLowerCase()
+      : '';
     const filter = {
       $or: [
         { userId: user.id },
