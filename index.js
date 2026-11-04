@@ -12,7 +12,7 @@ const app = express();
 const port = Number(process.env.PORT) || 5000;
 const authUrl = process.env.BETTER_AUTH_URL || 'http://localhost:3000';
 
-const catalog = require(path.join(__dirname, '../leebazz-client/public/leebazz-import-ready-catalog-final.json'));
+const catalog = require(path.join(__dirname, 'data/leebazz-import-ready-catalog-final.json'));
 
 const productsById = new Map(
   catalog.products.filter((product) => product.isActive).map((product) => [product.id, product]),
